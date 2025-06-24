@@ -26,6 +26,10 @@ use crate::common::get_latest_epoch;
 use crate::defi::{DexSearcher, IndexerDexSearcher, TradeType, Trader};
 use crate::HttpConfig;
 
+/*
+该模块为MEV套利系统提供完整的对象ID数据库，确保交易模拟时能正确加载所有依赖对象。
+
+*/
 #[derive(Clone, Debug, Parser)]
 pub struct Args {
     #[clap(long, default_value = "./pool_related_ids.txt")]

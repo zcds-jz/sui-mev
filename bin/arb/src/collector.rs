@@ -14,6 +14,12 @@ use tracing::{debug, error};
 
 use crate::types::Event;
 
+/*
+    是Sui MEV项目中负责交易收集的核心模块，主要实现两种交易收集器
+    1. PrivateTxCollector: 私有交易收集器，用于收集来自Sui节点的私有交易
+    2. PublicTxCollector: 公有交易收集器，用于收集来自Sui节点的公有交易
+    该模块为MEV套利系统提供实时交易数据源，是识别套利机会的基础组件。
+*/
 pub struct PublicTxCollector {
     path: String,
 }

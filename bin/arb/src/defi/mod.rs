@@ -161,6 +161,7 @@ impl Defi {
         self.dex_searcher.find_dexes(coin_in_type, coin_out_type).await
     }
 
+    //查找卖出路径(从指定代币到SUI)
     pub async fn find_sell_paths(&self, coin_in_type: &str) -> Result<Vec<Path>> {
         if coin::is_native_coin(coin_in_type) {
             return Ok(vec![Path::default()]);
@@ -227,6 +228,7 @@ impl Defi {
         Ok(routes.into_iter().map(Path::new).collect())
     }
 
+    //查找买入路径(从SUI到指定代币)
     pub async fn find_buy_paths(&self, coin_out_type: &str) -> Result<Vec<Path>> {
         let mut paths = self.find_sell_paths(coin_out_type).await?;
         for path in &mut paths {
@@ -239,6 +241,7 @@ impl Defi {
         Ok(paths)
     }
 
+    //查找最佳路径(从指定代币到指定代币)
     pub async fn find_best_path_exact_in(
         &self,
         paths: &[Path],
@@ -293,6 +296,7 @@ impl Defi {
         Ok(PathTradeResult::new(paths[best_idx].clone(), amount_in, best_trade_res))
     }
 
+    //构建最终交易数据
     pub async fn build_final_tx_data(
         &self,
         sender: SuiAddress,

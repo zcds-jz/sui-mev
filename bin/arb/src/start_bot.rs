@@ -21,6 +21,10 @@ use crate::{
     HttpConfig,
 };
 
+/*
+该模块是MEV套利系统的主入口，负责初始化所有组件并启动系统。
+*/
+
 #[derive(Clone, Debug, Parser)]
 pub struct Args {
     #[arg(long, env = "SUI_PRIVATE_KEY")]

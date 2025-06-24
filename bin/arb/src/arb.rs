@@ -57,8 +57,11 @@ pub async fn run(args: Args) -> Result<()> {
     let rpc_url = args.http_config.rpc_url.clone();
     let ipc_path = args.http_config.ipc_path.clone();
 
+    //将地址字符串转换为SuiAddress类型
     let sender = SuiAddress::from_str(&args.sender).map_err(|e| eyre::eyre!(e))?;
 
+    //创建一个对象池，用于管理Simulator实例
+    //每个Simulator实例都使用一个新的Tokio运行时来执行HTTP请求
     let simulator_pool = ObjectPool::new(1, move || {
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -112,13 +115,13 @@ impl Arb {
     #[allow(clippy::too_many_arguments)]
     pub async fn find_opportunity(
         &self,
-        sender: SuiAddress,
-        coin_type: &str,
-        pool_id: Option<ObjectID>,
-        gas_coins: Vec<ObjectRef>,
-        sim_ctx: SimulateCtx,
-        use_gss: bool,
-        source: Source,
+        sender: SuiAddress, //参与套利交易的发送方地址
+        coin_type: &str,    //表示套利交易中使用的代币类型
+        pool_id: Option<ObjectID>, //表示套利交易中使用的资金池ID
+        gas_coins: Vec<ObjectRef>, //表示参与交易的Gas代币引用
+        sim_ctx: SimulateCtx, //表示模拟交易上下文，包含当前的epoch等信息
+        use_gss: bool, //表示是否使用黄金分割搜索算法来优化交易参数
+        source: Source, //表示交易的来源，是公开交易还是私有的
     ) -> Result<ArbResult> {
         let gas_price = sim_ctx.epoch.gas_price;
 
@@ -126,12 +129,12 @@ impl Arb {
             let timer = Instant::now();
             let ctx = Arc::new(
                 TrialCtx::new(
-                    self.defi.clone(),
-                    sender,
-                    coin_type,
-                    pool_id,
-                    gas_coins.clone(),
-                    sim_ctx,
+                    self.defi.clone(),  // DeFi模块克隆
+                    sender,            // 交易发送方，交易发起地址
+                    coin_type,         // 目标代币类型，目标代币类型
+                    pool_id,           // 可选资金池ID
+                    gas_coins.clone(), // Gas代币引用，用于支付gas的代币
+                    sim_ctx,           // 模拟上下文，包含epoch等区块链状态
                 )
                 .await?,
             );
@@ -152,6 +155,7 @@ impl Arb {
                 joinset.spawn(async move { ctx.trial(grid).await }.in_current_span());
             }
 
+            //并行网格搜索中的结果聚合逻辑，确保最终获得最优的套利交易参数组合
             let mut max_trial_res = TrialResult::default();
             while let Some(Ok(trial_res)) = joinset.join_next().await {
                 // debug!(?trial_res, "Grid searching");
@@ -167,12 +171,14 @@ impl Arb {
             (max_trial_res, timer.elapsed())
         };
 
+        //这段代码是网格搜索算法的最后一道验证，确保只有真正能盈利的交易参数才会被采用。
         ensure!(
             max_trial_res.profit > 0,
             "cache_misses: {}. No profitable grid found",
             cache_misses
         );
 
+        //利用黄金分割算法来优化套利交易参数
         let gss_duration = if use_gss {
             // GSS
             let timer = Instant::now();
@@ -200,19 +206,22 @@ impl Arb {
         );
 
         let TrialResult {
-            amount_in,
-            trade_path,
-            profit,
+            amount_in, //参与套利交易的输入金额
+            trade_path, //表示套利交易的路径
+            profit, //表示套利交易的利润
             ..
         } = &max_trial_res;
 
+        //设置套利发现时间
         let mut source = source;
         if source.deadline().is_some() {
             source = source.with_arb_found_time(utils::current_time_ms());
         }
         // TODO make bid_amount configurable
+        //设置投标金额
         source = source.with_bid_amount(*profit / 10 * 9);
 
+        //构建交易数据
         let tx_data = self
             .defi
             .build_final_tx_data(sender, *amount_in, trade_path, gas_coins, gas_price, source)
@@ -365,11 +374,11 @@ impl TrialCtx {
 
 #[derive(Debug, Default, Clone)]
 pub struct TrialResult {
-    pub coin_type: String,
-    pub amount_in: u64,
-    pub profit: u64,
-    pub trade_path: Path,
-    pub cache_misses: u64,
+    pub coin_type: String,  //表示套利交易中使用的代币类型
+    pub amount_in: u64, //参与套利交易的输入金额
+    pub profit: u64, //表示套利交易的利润
+    pub trade_path: Path, //表示套利交易的路径
+    pub cache_misses: u64, //表示缓存未命中的次数
 }
 
 impl PartialOrd for TrialResult {

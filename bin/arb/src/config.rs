@@ -6,6 +6,14 @@ pub const GAS_BUDGET: u64 = 10_000_000_000;
 pub const MAX_SQRT_PRICE_X64: u128 = 79226673515401279992447579055;
 pub const MIN_SQRT_PRICE_X64: u128 = 4295048016;
 
+/*
+该文件的作用是集中管理项目中的硬编码配置，特别是：
+
+- 需要跨模块共享的常量
+- 需要频繁调整的参数
+- 代币白名单等业务规则
+通过集中配置可以避免魔法数字散落在代码各处，提高可维护性。
+*/
 pub fn pegged_coin_types() -> HashSet<&'static str> {
     HashSet::from_iter([
         SUI_COIN_TYPE,

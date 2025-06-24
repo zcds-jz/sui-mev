@@ -12,6 +12,16 @@ use sui_types::{
 };
 use tracing::info;
 
+/*
+PublicTxExecutor 是Sui MEV项目的交易执行器，主要功能包括：
+
+1. 核心功能 ：
+   
+   - 实现 Executor<TransactionData> trait
+   - 负责将MEV套利交易提交到Sui区块链
+   - 提供交易状态追踪和日志记录
+该执行器是MEV套利流水线的最后环节，负责将模拟验证通过的交易实际提交到区块链。   
+*/
 pub struct PublicTxExecutor {
     sui: SuiClient,
     keypair: SuiKeyPair,

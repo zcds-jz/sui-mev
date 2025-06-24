@@ -5,6 +5,10 @@ use shio::ShioItem;
 use sui_json_rpc_types::{SuiEvent, SuiTransactionBlockEffects};
 use sui_types::{digests::TransactionDigest, transaction::TransactionData};
 
+/*
+Action 枚举定义了执行器可以执行的操作，包括通知、执行公共交易和提交Shio出价。
+*/
+
 #[derive(Debug, Clone)]
 pub enum Action {
     NotifyViaTelegram(Message),
