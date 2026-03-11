@@ -4,7 +4,7 @@ use burberry::{async_trait, ActionSubmitter, Strategy};
 use eyre::Result;
 use sui_sdk::{types::event::EventID, SuiClient};
 use tokio::task::JoinSet;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     supported_protocols, token01_key,
@@ -29,6 +29,11 @@ impl PoolCreatedStrategy {
         let mut joinset = JoinSet::new();
         let cursors = self.db.get_processed_cursors()?;
         for protocol in supported_protocols() {
+            if should_skip_protocol_backfill(&protocol) {
+                warn!(%protocol, "skip protocol backfill by env override");
+                continue;
+            }
+
             let (sui, db) = (self.sui.clone(), self.db.clone());
             let pool_cache = self.pool_cache.clone();
             let cursor = cursors.get(&protocol).cloned().flatten();
@@ -44,6 +49,17 @@ impl PoolCreatedStrategy {
 
         info!("backfill_pools done");
         Ok(())
+    }
+}
+
+fn should_skip_protocol_backfill(protocol: &Protocol) -> bool {
+    if !matches!(protocol, Protocol::Cetus) {
+        return false;
+    }
+
+    match std::env::var("SKIP_CETUS_BACKFILL") {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"),
+        Err(_) => false,
     }
 }
 

@@ -3,7 +3,8 @@ use crate::types::ShioItem;
 use async_channel::Receiver;
 use burberry::{async_trait, Collector, CollectorStream};
 use eyre::Result;
-use tracing::warn;
+use tokio::time::{Duration, MissedTickBehavior};
+use tracing::{info, warn};
 
 pub struct ShioCollector {
     receiver: Receiver<ShioItem>,
@@ -31,8 +32,25 @@ impl Collector<ShioItem> for ShioCollector {
 
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, ShioItem>> {
         let stream = async_stream::stream! {
-            while let Ok(item) = self.receiver.clone().recv().await {
-                yield item;
+            let receiver = self.receiver.clone();
+            let mut received = 0u64;
+            let mut status_tick = tokio::time::interval(Duration::from_secs(15));
+            status_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    recv = receiver.recv() => {
+                        match recv {
+                            Ok(item) => {
+                                received = received.saturating_add(1);
+                                yield item;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    _ = status_tick.tick() => {
+                        info!(received, queue_len = receiver.len(), "shio collector alive");
+                    }
+                }
             }
 
             panic!("ShioCollector stream ended unexpectedly");

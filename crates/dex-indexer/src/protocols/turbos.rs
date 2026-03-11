@@ -13,9 +13,7 @@ use sui_sdk::{
 };
 // use sui_types::{dynamic_field::derive_dynamic_field_id, TypeTag};
 
-use utils::object::{
-    extract_object_id_from_move_struct, extract_struct_from_move_struct,
-};
+use utils::object::{extract_object_id_from_move_struct, extract_struct_from_move_struct};
 
 use super::{get_coin_decimals, get_pool_coins_type, SUI_RPC_NODE};
 use crate::{
@@ -185,7 +183,6 @@ pub fn turbos_related_object_ids() -> Vec<String> {
 }
 
 pub async fn turbos_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simulator>) -> Result<Vec<String>> {
-
     let parsed_pool = {
         let pool_obj = simulator
             .get_object(&pool.pool)
@@ -206,33 +203,32 @@ pub async fn turbos_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simulator>
         extract_object_id_from_move_struct(&id, "bytes")?
     };
 
-    let sui_client = SuiClientBuilder::default()
-    .build(SUI_RPC_NODE)
-    .await
-    .unwrap();
+    let sui_client = SuiClientBuilder::default().build(SUI_RPC_NODE).await.unwrap();
 
     let mut next_cursor = None;
     let mut tick_vec = Vec::new();
 
     loop {
-        let ret = sui_client.read_api().get_dynamic_fields(tickmap_id, next_cursor, None).await?;
+        let ret = sui_client
+            .read_api()
+            .get_dynamic_fields(tickmap_id, next_cursor, None)
+            .await?;
         next_cursor = ret.next_cursor;
-        tick_vec.extend(ret.data); 
+        tick_vec.extend(ret.data);
         if !ret.has_next_page {
             break;
         }
     }
 
-    let tick_vec: Vec<String> = tick_vec.iter().map(|field_info| {
-        field_info.object_id.to_string()
-    }).collect();
+    let tick_vec: Vec<String> = tick_vec
+        .iter()
+        .map(|field_info| field_info.object_id.to_string())
+        .collect();
 
     // println!("tick_vec ======> {:?}", tick_vec);
 
     Ok(tick_vec)
-
 }
-
 
 fn pool_layout(pool_id: ObjectID, simulator: Arc<dyn Simulator>) -> MoveStructLayout {
     TURBOS_POOL_LAYOUT
@@ -336,5 +332,4 @@ mod tests {
     //     let children_ids = turbos_pool_children_ids2(&pool, simulator).await.unwrap();
     //     // println!("{:?}", children_ids);
     // }
-
 }

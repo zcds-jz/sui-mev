@@ -1,3 +1,4 @@
+pub mod graph;
 pub mod notification;
 pub mod search;
 

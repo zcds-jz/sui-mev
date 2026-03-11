@@ -100,8 +100,5 @@ pub fn current_time_ms() -> u64 {
 }
 
 pub async fn new_test_sui_client() -> SuiClient {
-    SuiClientBuilder::default()
-        .build("")
-        .await
-        .unwrap()
+    SuiClientBuilder::default().build("").await.unwrap()
 }

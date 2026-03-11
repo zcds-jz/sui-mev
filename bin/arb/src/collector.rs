@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sui_json_rpc_types::{SuiEvent, SuiTransactionBlockEffects};
 use sui_types::{effects::TransactionEffects, transaction::TransactionData};
 use tokio::{io::AsyncReadExt, pin, time};
-use tracing::{debug, error};
+use tracing::{error, info, warn};
 
 use crate::types::Event;
 
@@ -32,6 +32,7 @@ impl PublicTxCollector {
     async fn connect(&self) -> Result<Stream> {
         let name = self.path.as_str().to_ns_name::<GenericNamespaced>()?;
         let conn = Stream::connect(name).await?;
+        info!(socket = %self.path, "public tx collector connected");
         Ok(conn)
     }
 }
@@ -48,11 +49,14 @@ impl Collector<Event> for PublicTxCollector {
         let mut events_len_buf = [0u8; 4];
 
         let stream = async_stream::stream! {
+            let mut received = 0u64;
+            let mut status_tick = time::interval(time::Duration::from_secs(15));
+            status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     result = conn.read_exact(&mut effects_len_buf) => {
                         if result.is_err() {
-                            debug!("Failed to read effects length");
+                            warn!(socket = %self.path, "failed to read effects length, reconnecting");
                             conn = self.connect().await.expect("Failed to reconnect to tx socket");
                             continue;
                         }
@@ -60,13 +64,13 @@ impl Collector<Event> for PublicTxCollector {
                         let effects_len = u32::from_be_bytes(effects_len_buf);
                         let mut effects_buf = vec![0u8; effects_len as usize];
                         if conn.read_exact(&mut effects_buf).await.is_err() {
-                            debug!("Failed to read effects");
+                            warn!(socket = %self.path, "failed to read effects, reconnecting");
                             conn = self.connect().await.expect("Failed to reconnect to tx socket");
                             continue;
                         }
 
                         if conn.read_exact(&mut events_len_buf).await.is_err() {
-                            debug!("Failed to read events length");
+                            warn!(socket = %self.path, "failed to read events length, reconnecting");
                             conn = self.connect().await.expect("Failed to reconnect to tx socket");
                             continue;
                         }
@@ -74,7 +78,7 @@ impl Collector<Event> for PublicTxCollector {
                         let events_len = u32::from_be_bytes(events_len_buf);
                         let mut events_buf = vec![0u8; events_len as usize];
                         if conn.read_exact(&mut events_buf).await.is_err() {
-                            debug!("Failed to read events");
+                            warn!(socket = %self.path, "failed to read events, reconnecting");
                             conn = self.connect().await.expect("Failed to reconnect to tx socket");
                             continue;
                         }
@@ -100,9 +104,13 @@ impl Collector<Event> for PublicTxCollector {
                         };
 
                         if let Ok(tx_effects) = SuiTransactionBlockEffects::try_from(tx_effects) {
+                            received = received.saturating_add(1);
                             yield Event::PublicTx(tx_effects, events);
                         }
 
+                    }
+                    _ = status_tick.tick() => {
+                        info!(socket = %self.path, received, "public tx collector alive");
                     }
                     else => {
                         time::sleep(time::Duration::from_millis(10)).await;
@@ -152,30 +160,47 @@ impl Collector<Event> for PrivateTxCollector {
         let (ws_stream, _) = tokio_tungstenite::connect_async(&self.ws_url)
             .await
             .expect("Failed to connect to relay server");
+        info!(ws = %self.ws_url, "private tx collector connected");
 
         let (_, read) = ws_stream.split();
 
         let stream = async_stream::stream! {
             pin!(read);
-            while let Some(message) = read.next().await {
-                let message = match message {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Relay websocket error: {:?}", e);
-                        continue;
-                    }
-                };
+            let mut received = 0u64;
+            let mut status_tick = time::interval(time::Duration::from_secs(15));
+            status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    message = read.next() => {
+                        let Some(message) = message else {
+                            warn!(ws = %self.ws_url, "relay websocket closed");
+                            break;
+                        };
 
-                let tx_message: TxMessage = serde_json::from_str(message.to_text().unwrap()).unwrap();
-                let tx_data = match TransactionData::try_from(tx_message) {
-                    Ok(tx_data) => tx_data,
-                    Err(e) => {
-                        error!("Invalid tx_message: {:?}", e);
-                        continue;
-                    }
-                };
+                        let message = match message {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                error!("Relay websocket error: {:?}", e);
+                                continue;
+                            }
+                        };
 
-                yield Event::PrivateTx(tx_data);
+                        let tx_message: TxMessage = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                        let tx_data = match TransactionData::try_from(tx_message) {
+                            Ok(tx_data) => tx_data,
+                            Err(e) => {
+                                error!("Invalid tx_message: {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        received = received.saturating_add(1);
+                        yield Event::PrivateTx(tx_data);
+                    }
+                    _ = status_tick.tick() => {
+                        info!(ws = %self.ws_url, received, "private tx collector alive");
+                    }
+                }
             }
         };
 

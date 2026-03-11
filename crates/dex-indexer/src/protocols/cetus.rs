@@ -17,7 +17,12 @@ use sui_sdk::{
     SuiClient, SuiClientBuilder,
 };
 use sui_types::{
-    base_types::SuiAddress, dynamic_field::derive_dynamic_field_id, object::Object, programmable_transaction_builder::ProgrammableTransactionBuilder, transaction::{Command, TransactionData}, Identifier
+    base_types::SuiAddress,
+    dynamic_field::derive_dynamic_field_id,
+    object::Object,
+    programmable_transaction_builder::ProgrammableTransactionBuilder,
+    transaction::{Command, TransactionData},
+    Identifier,
 };
 use utils::object::*;
 
@@ -47,7 +52,7 @@ pub struct CetusPoolCreated {
     pub pool: ObjectID,
     pub token0: String,
     pub token1: String,
-} 
+}
 
 impl TryFrom<&SuiEvent> for CetusPoolCreated {
     type Error = eyre::Error;
@@ -217,7 +222,7 @@ pub fn cetus_related_object_ids() -> Vec<String> {
         "0xe2b515f0052c0b3f83c23db045d49dbe1732818ccfc5d4596c9482f7f2e76a85", // PoolMath 2
         "0xe93247b408fe44ed0ee5b6ac508b36325b239d6333e44ffa240dcc0c1a69cdd8", // PoolMath 3
         "0x74bb5afd49dddf13007101238012c033a5138474e00338126b318b5e3e4603a9", // Frequent Unkown ID
-        "0xbfda3feb64a496c8d7fbb39a152d632ec1d1cefb2010b349adc3460937a592fe"  // Frequent Unkown ID
+        "0xbfda3feb64a496c8d7fbb39a152d632ec1d1cefb2010b349adc3460937a592fe", // Frequent Unkown ID
     ]
     .into_iter()
     .map(|s| s.to_string())
@@ -251,30 +256,31 @@ pub async fn cetus_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simulator>)
 
         id
     };
-    let sui_client = SuiClientBuilder::default()
-    .build(SUI_RPC_NODE)
-    .await
-    .unwrap();
+    let sui_client = SuiClientBuilder::default().build(SUI_RPC_NODE).await.unwrap();
 
     let mut next_cursor = None;
     let mut tick_vec = Vec::new();
 
     loop {
-        let ret = sui_client.read_api().get_dynamic_fields(positions_id, next_cursor, None).await?;
+        let ret = sui_client
+            .read_api()
+            .get_dynamic_fields(positions_id, next_cursor, None)
+            .await?;
         next_cursor = ret.next_cursor;
-        tick_vec.extend(ret.data); 
+        tick_vec.extend(ret.data);
         if !ret.has_next_page {
             break;
         }
     }
 
-    let tick_vec: Vec<String> = tick_vec.iter().map(|field_info| {
-        field_info.object_id.to_string()
-    }).collect();
-   
+    let tick_vec: Vec<String> = tick_vec
+        .iter()
+        .map(|field_info| field_info.object_id.to_string())
+        .collect();
+
     result.extend(tick_vec);
 
-     // get tick id
+    // get tick id
     let key_tag = TypeTag::U64;
     let ticks = {
         let mut result = HashSet::new();
@@ -291,20 +297,21 @@ pub async fn cetus_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simulator>)
 
         let mut next_cursor = None;
         let mut tick_vec = Vec::new();
-    
+
         loop {
             let ret = sui_client.read_api().get_dynamic_fields(id, next_cursor, None).await?;
             next_cursor = ret.next_cursor;
-            tick_vec.extend(ret.data); 
+            tick_vec.extend(ret.data);
             if !ret.has_next_page {
                 break;
             }
         }
 
-        let tick_vec: Vec<String> = tick_vec.iter().map(|field_info| {
-            field_info.object_id.to_string()
-        }).collect();
-    
+        let tick_vec: Vec<String> = tick_vec
+            .iter()
+            .map(|field_info| field_info.object_id.to_string())
+            .collect();
+
         result.extend(tick_vec);
 
         for tick_score in get_tick_scores(pool, &pool_obj, simulator).await? {
@@ -397,8 +404,8 @@ mod tests {
     use super::*;
     use mev_logger::LevelFilter;
     use simulator::{DBSimulator, HttpSimulator};
-    use tokio::time::Instant;
     use std::str::FromStr;
+    use tokio::time::Instant;
 
     #[tokio::test]
     async fn test_swap_event_http() {
@@ -461,12 +468,11 @@ mod tests {
         let children_ids = cetus_pool_children_ids(&pool, simulator).await.unwrap();
         println!("Took==============> : {} ms", start.elapsed().as_millis());
         println!("{:?}", children_ids);
-    } 
+    }
 
     #[tokio::test]
     async fn test_judge_cetus_pool_children_ids() {
         let pool = Pool {
-            
             protocol: Protocol::Cetus,
             pool: ObjectID::from_str("0xefb30c2780bb10ffd4cf860049248dcc4b204927ca63c4c2e4d0ae5666a280d5").unwrap(),
             tokens: vec![
@@ -483,12 +489,13 @@ mod tests {
 
         // let start = Instant::now();
         let children_ids = cetus_pool_children_ids(&pool, simulator).await.unwrap();
-        if children_ids.contains(&"0x2dd0e8a1758121da7fc615a7d8923ffeaeb9ae5852882d2d4179193e3b9e7c1e".to_string()) || children_ids.contains(&"0x26e641e6c1734ed2733701e6f7708f0c8816c665c31b89a7cfd6fee3ffdcfb82".to_string()) {
+        if children_ids.contains(&"0x2dd0e8a1758121da7fc615a7d8923ffeaeb9ae5852882d2d4179193e3b9e7c1e".to_string())
+            || children_ids.contains(&"0x26e641e6c1734ed2733701e6f7708f0c8816c665c31b89a7cfd6fee3ffdcfb82".to_string())
+        {
             println!("==================> Success");
         } else {
             println!("==================> Failed");
         }
         // Get Position
-
     }
 }

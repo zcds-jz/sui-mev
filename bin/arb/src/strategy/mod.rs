@@ -5,14 +5,14 @@ use std::{
     collections::{HashSet, VecDeque},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arb_cache::{ArbCache, ArbItem};
 use async_channel::Sender;
 use burberry::ActionSubmitter;
 use dex_indexer::types::Protocol;
-use eyre::{ensure, eyre, Result};
+use eyre::{ensure, Result};
 use fastcrypto::encoding::{Base64, Encoding};
 use object_pool::ObjectPool;
 use rayon::prelude::*;
@@ -36,7 +36,7 @@ use tracing::{debug, error, info, instrument, warn};
 use worker::Worker;
 
 use crate::{
-    arb::Arb,
+    arb::{Arb, SearchConfig},
     common::get_latest_epoch,
     types::{Action, Event, Source},
 };
@@ -53,9 +53,30 @@ pub struct ArbStrategy {
     own_simulator: Arc<dyn Simulator>, // only for execution of pending txs
     rpc_url: String,
     workers: usize,
+    worker_init_timeout_secs: u64,
+    search_config: SearchConfig,
     sui: SuiClient,
     epoch: Option<SimEpoch>,
     dedicated_simulator: Option<Arc<ReplaySimulator>>,
+    shio_stats: ShioStats,
+    shio_stats_last_log: Instant,
+}
+
+#[derive(Default)]
+struct ShioStats {
+    total_items: u64,
+    candidates: u64,
+    dropped_no_events: u64,
+    dropped_no_supported_protocol_events: u64,
+    dropped_no_supported_swap_events: u64,
+    dropped_invalid_tx_digest: u64,
+}
+
+enum ShioDropReason {
+    NoEvents,
+    NoSupportedProtocolEvents,
+    NoSupportedSwapEvents,
+    InvalidTxDigest,
 }
 
 impl ArbStrategy {
@@ -67,6 +88,8 @@ impl ArbStrategy {
         rpc_url: &str,
         workers: usize,
         dedicated_simulator: Option<Arc<ReplaySimulator>>,
+        search_config: SearchConfig,
+        worker_init_timeout_secs: u64,
     ) -> Self {
         let sui = SuiClientBuilder::default().build(&rpc_url).await.unwrap();
         let epoch = get_latest_epoch(&sui).await.unwrap();
@@ -81,9 +104,13 @@ impl ArbStrategy {
             own_simulator,
             rpc_url: rpc_url.to_string(),
             workers,
+            worker_init_timeout_secs,
+            search_config,
             sui,
             epoch: Some(epoch),
             dedicated_simulator,
+            shio_stats: ShioStats::default(),
+            shio_stats_last_log: Instant::now(),
         }
     }
 
@@ -103,6 +130,17 @@ impl ArbStrategy {
         }
 
         let tx_digest = tx_effects.transaction_digest();
+        let sample = coin_pools
+            .iter()
+            .next()
+            .map(|(coin, pool_id)| format!("{}@{:?}", short_coin(coin), pool_id))
+            .unwrap_or_else(|| "-".to_string());
+        info!(
+            tx = %tx_digest,
+            candidate_count = coin_pools.len(),
+            sample = %sample,
+            "发现候选机会（待模拟）"
+        );
         let epoch = self.get_latest_epoch().await?;
         let sim_ctx = SimulateCtx::new(epoch, vec![]);
 
@@ -116,12 +154,37 @@ impl ArbStrategy {
 
     #[instrument(name = "on-new-shio-item", skip_all, fields(tx = %shio_item.tx_digest()))]
     async fn on_new_shio_item(&mut self, shio_item: ShioItem) -> Result<()> {
+        self.shio_stats.total_items = self.shio_stats.total_items.saturating_add(1);
         let (coin_pools, override_objects) = match self.get_potential_opportunity(&shio_item).await {
-            Some(potential_opportunity) => potential_opportunity,
-            None => return Ok(()),
+            Ok(potential_opportunity) => potential_opportunity,
+            Err(reason) => {
+                self.record_shio_drop(reason);
+                self.maybe_log_shio_stats();
+                return Ok(());
+            }
         };
 
-        let tx_digest = TransactionDigest::from_str(shio_item.tx_digest()).map_err(|e| eyre!(e))?;
+        let tx_digest = match TransactionDigest::from_str(shio_item.tx_digest()) {
+            Ok(tx_digest) => tx_digest,
+            Err(_) => {
+                self.record_shio_drop(ShioDropReason::InvalidTxDigest);
+                self.maybe_log_shio_stats();
+                return Ok(());
+            }
+        };
+        self.shio_stats.candidates = self.shio_stats.candidates.saturating_add(1);
+        let sample = coin_pools
+            .iter()
+            .next()
+            .map(|(coin, pool_id)| format!("{}@{:?}", short_coin(coin), pool_id))
+            .unwrap_or_else(|| "-".to_string());
+        info!(
+            tx = %tx_digest,
+            candidate_count = coin_pools.len(),
+            sample = %sample,
+            deadline = shio_item.deadline_timestamp_ms(),
+            "发现 Shio 候选机会（待模拟）"
+        );
         let epoch = self.get_latest_epoch().await?;
         let mut sim_ctx = SimulateCtx::new(epoch, override_objects);
         // A bid must has the exact gas_price as the opportunity transaction's.
@@ -140,6 +203,7 @@ impl ArbStrategy {
             self.arb_cache.insert(coin, pool_id, tx_digest, sim_ctx.clone(), source);
         }
 
+        self.maybe_log_shio_stats();
         Ok(())
     }
 
@@ -172,46 +236,90 @@ impl ArbStrategy {
     async fn get_potential_opportunity(
         &self,
         shio_item: &ShioItem,
-    ) -> Option<(HashSet<(String, Option<ObjectID>)>, Vec<ObjectReadResult>)> {
+    ) -> std::result::Result<(HashSet<(String, Option<ObjectID>)>, Vec<ObjectReadResult>), ShioDropReason> {
         // parse involved coins from swap events
         let events = shio_item.events();
         if events.is_empty() {
-            return None;
+            return Err(ShioDropReason::NoEvents);
         }
 
         let mut join_set = JoinSet::new();
+        let mut supported_protocol_events = 0usize;
         for event in events {
-            let own_simulator = self.own_simulator.clone();
-            join_set.spawn(async move {
-                if let Ok(protocol) = Protocol::try_from(&event) {
+            if let Ok(protocol) = Protocol::try_from(&event) {
+                supported_protocol_events += 1;
+                let own_simulator = self.own_simulator.clone();
+                join_set.spawn(async move {
                     if let Ok(swap_event) = protocol.shio_event_to_swap_event(&event, own_simulator).await {
                         return Some((swap_event.involved_coin_one_side(), swap_event.pool_id()));
                     }
-                }
-                None
-            });
+                    None
+                });
+            }
+        }
+
+        if supported_protocol_events == 0 {
+            return Err(ShioDropReason::NoSupportedProtocolEvents);
         }
 
         let mut involved_coin_pools = HashSet::new();
+        let mut parsed_swap_events = 0usize;
         while let Some(result) = join_set.join_next().await {
             if let Ok(Some((coin, pool_id))) = result {
+                parsed_swap_events += 1;
                 involved_coin_pools.insert((coin, pool_id));
             }
         }
 
-        if involved_coin_pools.is_empty() {
-            return None;
+        if parsed_swap_events == 0 || involved_coin_pools.is_empty() {
+            return Err(ShioDropReason::NoSupportedSwapEvents);
         }
 
         // parse override_objects from created/mutated objects
-        let tx_digest = TransactionDigest::from_str(shio_item.tx_digest()).ok()?;
+        let tx_digest =
+            TransactionDigest::from_str(shio_item.tx_digest()).map_err(|_| ShioDropReason::InvalidTxDigest)?;
         let override_objects: Vec<ObjectReadResult> = shio_item
             .created_mutated_objects()
             .par_iter()
             .filter_map(|shio_obj| new_object_read_result(tx_digest, shio_obj).ok())
             .collect();
 
-        Some((involved_coin_pools, override_objects))
+        Ok((involved_coin_pools, override_objects))
+    }
+
+    fn record_shio_drop(&mut self, reason: ShioDropReason) {
+        match reason {
+            ShioDropReason::NoEvents => {
+                self.shio_stats.dropped_no_events = self.shio_stats.dropped_no_events.saturating_add(1)
+            }
+            ShioDropReason::NoSupportedProtocolEvents => {
+                self.shio_stats.dropped_no_supported_protocol_events =
+                    self.shio_stats.dropped_no_supported_protocol_events.saturating_add(1)
+            }
+            ShioDropReason::NoSupportedSwapEvents => {
+                self.shio_stats.dropped_no_supported_swap_events =
+                    self.shio_stats.dropped_no_supported_swap_events.saturating_add(1)
+            }
+            ShioDropReason::InvalidTxDigest => {
+                self.shio_stats.dropped_invalid_tx_digest = self.shio_stats.dropped_invalid_tx_digest.saturating_add(1)
+            }
+        }
+    }
+
+    fn maybe_log_shio_stats(&mut self) {
+        if self.shio_stats_last_log.elapsed() < Duration::from_secs(30) {
+            return;
+        }
+        self.shio_stats_last_log = Instant::now();
+        info!(
+            total = self.shio_stats.total_items,
+            candidates = self.shio_stats.candidates,
+            drop_no_events = self.shio_stats.dropped_no_events,
+            drop_no_supported_protocol = self.shio_stats.dropped_no_supported_protocol_events,
+            drop_no_supported_swap = self.shio_stats.dropped_no_supported_swap_events,
+            drop_invalid_tx_digest = self.shio_stats.dropped_invalid_tx_digest,
+            "shio drop stats"
+        );
     }
 
     async fn get_latest_epoch(&mut self) -> Result<SimEpoch> {
@@ -306,11 +414,13 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
 
         let sender = self.sender;
         let rpc_url = self.rpc_url.clone();
+        let search_config = self.search_config.clone();
 
         let workers_to_spawn = self.workers;
         info!("spawning {} workers to process messages", workers_to_spawn);
 
-        let (init_tx, mut init_rx) = tokio::sync::mpsc::channel(workers_to_spawn);
+        let (init_tx, mut init_rx) =
+            tokio::sync::mpsc::channel::<(usize, std::result::Result<(), String>)>(workers_to_spawn);
 
         for id in 0..workers_to_spawn {
             debug!(worker.id = id, "spawning worker...");
@@ -325,15 +435,27 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
             let simulator_pool_worker = self.simulator_pool.clone();
             let simulator_name = simulator_pool_arb.get().name().to_string();
             let dedicated_simulator = self.dedicated_simulator.clone();
+            let search_config = search_config.clone();
 
             let _ = std::thread::Builder::new()
                 .stack_size(128 * 1024 * 1024) // 128 MB
                 .name(format!("worker-{id}"))
                 .spawn(move || {
-                    let arb = Arc::new(run_in_tokio!({ Arb::new(&rpc_url, simulator_pool_arb) }).unwrap());
+                    info!(worker.id = id, "worker initialization started");
+                    let arb = match run_in_tokio!({ Arb::new(&rpc_url, simulator_pool_arb, search_config.clone()) }) {
+                        Ok(arb) => Arc::new(arb),
+                        Err(error) => {
+                            let error_msg = format!("{error:#}");
+                            let error_msg_send = error_msg.clone();
+                            let _ = run_in_tokio!(init_tx.send((id, Err(error_msg_send))));
+                            error!(worker.id = id, error = %error_msg, "worker initialization failed");
+                            return;
+                        }
+                    };
 
                     // Signal that this worker is initialized
-                    run_in_tokio!(init_tx.send(())).unwrap();
+                    let _ = run_in_tokio!(init_tx.send((id, Ok(()))));
+                    info!(worker.id = id, "worker initialization finished");
 
                     let worker = Worker {
                         _id: id,
@@ -350,10 +472,64 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
                 });
         }
 
+        drop(init_tx);
+
         // Wait for all workers to initialize
-        for _ in 0..workers_to_spawn {
-            init_rx.recv().await.expect("worker initialization failed");
+        let mut initialized = 0usize;
+        let mut failed = 0usize;
+        while initialized + failed < workers_to_spawn {
+            let wait_result = if self.worker_init_timeout_secs == 0 {
+                init_rx.recv().await
+            } else {
+                match tokio::time::timeout(Duration::from_secs(self.worker_init_timeout_secs), init_rx.recv()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        error!(
+                            initialized,
+                            failed,
+                            total = workers_to_spawn,
+                            timeout_secs = self.worker_init_timeout_secs,
+                            "worker initialization timed out"
+                        );
+                        break;
+                    }
+                }
+            };
+
+            match wait_result {
+                Some((worker_id, Ok(()))) => {
+                    initialized += 1;
+                    info!(
+                        worker.id = worker_id,
+                        initialized,
+                        total = workers_to_spawn,
+                        "worker ready"
+                    );
+                }
+                Some((worker_id, Err(err))) => {
+                    failed += 1;
+                    error!(worker.id = worker_id, error = %err, "worker init reported failure");
+                }
+                None => {
+                    error!("worker init channel closed before all workers finished");
+                    break;
+                }
+            }
         }
+        ensure!(
+            initialized == workers_to_spawn,
+            "only {initialized}/{workers_to_spawn} workers initialized (failed: {failed})"
+        );
+
+        let queue_monitor = arb_item_receiver.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                info!(queue_len = queue_monitor.len(), "arb worker queue alive");
+            }
+        });
 
         info!("workers all spawned!");
         Ok(())
@@ -378,6 +554,13 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
                 if let Some(item) = self.arb_cache.pop_one() {
                     if !self.recent_arbs.contains(&item.coin) || item.source.is_shio() {
                         let coin = item.coin.clone();
+                        info!(
+                            coin = %short_coin(&item.coin),
+                            pool_id = ?item.pool_id,
+                            tx = %item.tx_digest,
+                            source = %item.source,
+                            "候选机会入队，准备进入模拟搜索"
+                        );
                         self.arb_item_sender.as_ref().unwrap().send(item).await.unwrap();
 
                         self.recent_arbs.push_back(coin);
@@ -401,4 +584,8 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
             }
         }
     }
+}
+
+fn short_coin(coin: &str) -> &str {
+    coin.split("::").last().unwrap_or(coin)
 }

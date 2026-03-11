@@ -14,6 +14,7 @@ use sui_types::{base_types::SuiAddress, crypto::SuiKeyPair};
 use tracing::{info, warn};
 
 use crate::{
+    arb::SearchConfig,
     collector::{PrivateTxCollector, PublicTxCollector},
     executor::PublicTxExecutor,
     strategy::ArbStrategy,
@@ -117,6 +118,22 @@ struct WorkerConfig {
     /// long: 200ms
     #[arg(long, default_value_t = 200)]
     pub dedicated_long_interval: u64,
+
+    /// enable graph-based shortest-path pruning before simulation
+    #[arg(long, env = "ARB_GRAPH_SEARCH_ENABLED", default_value_t = false)]
+    pub graph_search_enabled: bool,
+
+    /// allow path weight to exceed graph shortest path by this tolerance
+    #[arg(long, env = "ARB_GRAPH_HOP_TOLERANCE", default_value_t = 0)]
+    pub graph_hop_tolerance: usize,
+
+    /// max candidate paths kept for buy/sell side after graph pruning
+    #[arg(long, env = "ARB_GRAPH_MAX_PATHS_PER_SIDE", default_value_t = 32)]
+    pub graph_max_paths_per_side: usize,
+
+    /// worker init timeout in seconds, 0 means no timeout
+    #[arg(long, env = "ARB_WORKER_INIT_TIMEOUT_SECS", default_value_t = 0)]
+    pub worker_init_timeout_secs: u64,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -124,7 +141,7 @@ pub async fn run(args: Args) -> Result<()> {
     mev_logger::init_with_whitelisted_modules(
         "mainnet",
         "sui-arb".to_string(),
-        &["arb", "utils", "shio", "cache_metrics=debug"],
+        &["arb", "utils", "shio", "dex_indexer", "cache_metrics=debug"],
     );
 
     let keypair = SuiKeyPair::decode(&args.private_key)?;
@@ -145,6 +162,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut engine = Engine::default();
 
     if let Some(ref ws_url) = args.collector_config.shio_ws_url {
+        info!(ws = %ws_url, "using shio collector");
         let (shio_collector, shio_executor) =
             new_shio_collector_and_executor(keypair, Some(ws_url.clone()), None).await;
         engine.add_collector(map_collector!(shio_collector, Event::Shio));
@@ -156,6 +174,7 @@ pub async fn run(args: Args) -> Result<()> {
             engine.add_executor(map_executor!(shio_executor, Action::ShioSubmitBid));
         }
     } else {
+        info!(socket = %tx_socket_path, "using public tx collector");
         let public_tx_collector = PublicTxCollector::new(&tx_socket_path);
         engine.add_collector(Box::new(public_tx_collector));
     }
@@ -166,6 +185,7 @@ pub async fn run(args: Args) -> Result<()> {
     ));
 
     if let Some(ref relay_ws_url) = args.collector_config.relay_ws_url {
+        info!(ws = %relay_ws_url, "using private tx collector");
         let private_tx_collector = PrivateTxCollector::new(relay_ws_url);
         engine.add_collector(Box::new(private_tx_collector));
     }
@@ -239,6 +259,12 @@ pub async fn run(args: Args) -> Result<()> {
         &rpc_url,
         args.worker_config.workers,
         dedicated_simulator,
+        SearchConfig {
+            graph_search_enabled: args.worker_config.graph_search_enabled,
+            graph_hop_tolerance: args.worker_config.graph_hop_tolerance,
+            graph_max_paths_per_side: args.worker_config.graph_max_paths_per_side,
+        },
+        args.worker_config.worker_init_timeout_secs,
     )
     .await;
     engine.add_strategy(Box::new(arb_strategy));

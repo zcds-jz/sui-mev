@@ -1,8 +1,9 @@
 use async_channel::{Receiver, Sender};
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::ShioItem;
 
@@ -20,6 +21,7 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
         loop {
             let (mut wss_stream, _) = match tokio_tungstenite::connect_async(&wss_url).await {
                 Ok(r) => {
+                    info!(ws = %wss_url, "connected to shio feed websocket");
                     retry_count = 0;
                     r
                 }
@@ -35,6 +37,12 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
                 }
             };
 
+            let mut feed_messages = 0u64;
+            let mut sent_bids = 0u64;
+            let mut pong_count = 0u64;
+            let mut status_tick = tokio::time::interval(Duration::from_secs(15));
+            status_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
             'connected: loop {
                 // either receive from bid_receiver or wss_stream
                 tokio::select! {
@@ -44,6 +52,7 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
                             error!("fail to send message to ws server: {e:#}");
                             break 'connected;
                         }
+                        sent_bids = sent_bids.saturating_add(1);
                     }
                     Some(msg) = wss_stream.next() => {
                         match msg {
@@ -55,6 +64,7 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
                                         continue;
                                     }
                                 };
+                                feed_messages = feed_messages.saturating_add(1);
                                 shio_item_sender.send(ShioItem::from(value)).await.unwrap();
                             }
                             Ok(Message::Ping(val)) => {
@@ -62,8 +72,13 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
                                     error!("Failed to send pong: {}", e);
                                     break 'connected;
                                 }
+                                pong_count = pong_count.saturating_add(1);
                             }
-                            Ok(Message::Close(_)) | Ok(Message::Frame(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {
+                            Ok(Message::Close(_)) => {
+                                warn!(ws = %wss_url, "shio feed websocket closed by server");
+                                break 'connected;
+                            }
+                            Ok(Message::Frame(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {
                                 panic!("unexpected websocket message: {:?}", msg);
                             }
                             Err(e) => {
@@ -72,8 +87,19 @@ pub async fn new_shio_conn(wss_url: String, num_retries: u32) -> (Sender<Value>,
                             }
                         }
                     }
+                    _ = status_tick.tick() => {
+                        info!(
+                            ws = %wss_url,
+                            feed_messages,
+                            sent_bids,
+                            pong_count,
+                            "shio websocket alive"
+                        );
+                    }
                 }
             }
+
+            warn!(ws = %wss_url, "shio websocket disconnected, reconnecting");
         }
     });
 

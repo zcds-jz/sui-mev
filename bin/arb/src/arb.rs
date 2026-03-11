@@ -3,6 +3,7 @@
 //!     "0xa8816d3a6e3136e86bc2873b1f94a15cadc8af2703c075f2d546c2ae367f4df9::ocean::OCEAN"
 
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
     str::FromStr,
     sync::Arc,
@@ -11,11 +12,12 @@ use std::{
 
 use async_trait::async_trait;
 use clap::Parser;
+use dex_indexer::types::Protocol;
 use eyre::{ensure, ContextCompat, Result};
 use itertools::Itertools;
 use object_pool::ObjectPool;
 use simulator::{HttpSimulator, SimulateCtx, Simulator};
-use sui_sdk::SuiClientBuilder;
+use sui_sdk::{SuiClientBuilder, SUI_COIN_TYPE};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SuiAddress},
     transaction::TransactionData,
@@ -26,8 +28,9 @@ use utils::coin;
 
 use crate::{
     common::get_latest_epoch,
+    common::graph::WeightedDigraph,
     common::search::{golden_section_search_maximize, SearchGoal},
-    defi::{Defi, Path, TradeType},
+    defi::{Defi, Dex, Path, TradeType},
     types::Source,
     HttpConfig,
 };
@@ -40,10 +43,7 @@ pub struct Args {
     #[arg(long)]
     pub pool_id: Option<String>,
 
-    #[arg(
-        long,
-        default_value = ""
-    )]
+    #[arg(long, default_value = "")]
     pub sender: String,
 
     #[command(flatten)]
@@ -57,18 +57,20 @@ pub async fn run(args: Args) -> Result<()> {
     let rpc_url = args.http_config.rpc_url.clone();
     let ipc_path = args.http_config.ipc_path.clone();
 
-    //将地址字符串转换为SuiAddress类型
     let sender = SuiAddress::from_str(&args.sender).map_err(|e| eyre::eyre!(e))?;
 
-    //创建一个对象池，用于管理Simulator实例
-    //每个Simulator实例都使用一个新的Tokio运行时来执行HTTP请求
     let simulator_pool = ObjectPool::new(1, move || {
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { Box::new(HttpSimulator::new(&rpc_url, &ipc_path).await) as Box<dyn Simulator> })
     });
 
-    let arb = Arb::new(&args.http_config.rpc_url, Arc::new(simulator_pool)).await?;
+    let arb = Arb::new(
+        &args.http_config.rpc_url,
+        Arc::new(simulator_pool),
+        SearchConfig::default(),
+    )
+    .await?;
     let sui = SuiClientBuilder::default().build(&args.http_config.rpc_url).await?;
     let gas_coins = coin::get_gas_coin_refs(&sui, sender, None).await?;
     let epoch = get_latest_epoch(&sui).await?;
@@ -102,26 +104,48 @@ pub struct ArbResult {
     pub tx_data: TransactionData,
 }
 
+#[derive(Clone, Debug)]
+pub struct SearchConfig {
+    pub graph_search_enabled: bool,
+    pub graph_hop_tolerance: usize,
+    pub graph_max_paths_per_side: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            graph_search_enabled: false,
+            graph_hop_tolerance: 0,
+            graph_max_paths_per_side: 32,
+        }
+    }
+}
+
 pub struct Arb {
     defi: Defi,
+    search_config: SearchConfig,
 }
 
 impl Arb {
-    pub async fn new(http_url: &str, simulator_pool: Arc<ObjectPool<Box<dyn Simulator>>>) -> Result<Self> {
+    pub async fn new(
+        http_url: &str,
+        simulator_pool: Arc<ObjectPool<Box<dyn Simulator>>>,
+        search_config: SearchConfig,
+    ) -> Result<Self> {
         let defi = Defi::new(http_url, simulator_pool).await?;
-        Ok(Self { defi })
+        Ok(Self { defi, search_config })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub async fn find_opportunity(
         &self,
-        sender: SuiAddress, //参与套利交易的发送方地址
-        coin_type: &str,    //表示套利交易中使用的代币类型
-        pool_id: Option<ObjectID>, //表示套利交易中使用的资金池ID
-        gas_coins: Vec<ObjectRef>, //表示参与交易的Gas代币引用
-        sim_ctx: SimulateCtx, //表示模拟交易上下文，包含当前的epoch等信息
-        use_gss: bool, //表示是否使用黄金分割搜索算法来优化交易参数
-        source: Source, //表示交易的来源，是公开交易还是私有的
+        sender: SuiAddress,
+        coin_type: &str,
+        pool_id: Option<ObjectID>,
+        gas_coins: Vec<ObjectRef>,
+        sim_ctx: SimulateCtx,
+        use_gss: bool,
+        source: Source,
     ) -> Result<ArbResult> {
         let gas_price = sim_ctx.epoch.gas_price;
 
@@ -129,18 +153,26 @@ impl Arb {
             let timer = Instant::now();
             let ctx = Arc::new(
                 TrialCtx::new(
-                    self.defi.clone(),  // DeFi模块克隆
-                    sender,            // 交易发送方，交易发起地址
-                    coin_type,         // 目标代币类型，目标代币类型
-                    pool_id,           // 可选资金池ID
-                    gas_coins.clone(), // Gas代币引用，用于支付gas的代币
-                    sim_ctx,           // 模拟上下文，包含epoch等区块链状态
+                    self.defi.clone(),
+                    sender,
+                    coin_type,
+                    pool_id,
+                    gas_coins.clone(),
+                    sim_ctx,
+                    self.search_config.clone(),
                 )
                 .await?,
             );
 
             (ctx, timer.elapsed())
         };
+        info!(
+            coin_type,
+            buy_path_candidates = ctx.buy_paths.len(),
+            sell_path_candidates = ctx.sell_paths.len(),
+            graph_search_enabled = self.search_config.graph_search_enabled,
+            "机会搜索上下文初始化完成"
+        );
 
         // Grid search
         let starting_grid = 1_000_000u64; // 0.001 SUI
@@ -155,7 +187,6 @@ impl Arb {
                 joinset.spawn(async move { ctx.trial(grid).await }.in_current_span());
             }
 
-            //并行网格搜索中的结果聚合逻辑，确保最终获得最优的套利交易参数组合
             let mut max_trial_res = TrialResult::default();
             while let Some(Ok(trial_res)) = joinset.join_next().await {
                 // debug!(?trial_res, "Grid searching");
@@ -171,14 +202,12 @@ impl Arb {
             (max_trial_res, timer.elapsed())
         };
 
-        //这段代码是网格搜索算法的最后一道验证，确保只有真正能盈利的交易参数才会被采用。
         ensure!(
             max_trial_res.profit > 0,
             "cache_misses: {}. No profitable grid found",
             cache_misses
         );
 
-        //利用黄金分割算法来优化套利交易参数
         let gss_duration = if use_gss {
             // GSS
             let timer = Instant::now();
@@ -206,22 +235,19 @@ impl Arb {
         );
 
         let TrialResult {
-            amount_in, //参与套利交易的输入金额
-            trade_path, //表示套利交易的路径
-            profit, //表示套利交易的利润
+            amount_in,
+            trade_path,
+            profit,
             ..
         } = &max_trial_res;
 
-        //设置套利发现时间
         let mut source = source;
         if source.deadline().is_some() {
             source = source.with_arb_found_time(utils::current_time_ms());
         }
         // TODO make bid_amount configurable
-        //设置投标金额
         source = source.with_bid_amount(*profit / 10 * 9);
 
-        //构建交易数据
         let tx_data = self
             .defi
             .build_final_tx_data(sender, *amount_in, trade_path, gas_coins, gas_price, source)
@@ -248,6 +274,7 @@ pub struct TrialCtx {
     sell_paths: Vec<Path>,
     gas_coins: Vec<ObjectRef>,
     sim_ctx: SimulateCtx,
+    search_config: SearchConfig,
 }
 
 impl TrialCtx {
@@ -258,12 +285,29 @@ impl TrialCtx {
         pool_id: Option<ObjectID>,
         gas_coins: Vec<ObjectRef>,
         sim_ctx: SimulateCtx,
+        search_config: SearchConfig,
     ) -> Result<Self> {
-        let buy_paths = defi.find_buy_paths(coin_type).await?;
-        ensure!(!buy_paths.is_empty(), "no buy paths found for {}", coin_type);
+        let raw_buy_paths = defi.find_buy_paths(coin_type).await?;
+        ensure!(!raw_buy_paths.is_empty(), "no buy paths found for {}", coin_type);
 
-        let sell_paths = defi.find_sell_paths(coin_type).await?;
-        ensure!(!sell_paths.is_empty(), "no sell paths found for {}", coin_type);
+        let raw_sell_paths = defi.find_sell_paths(coin_type).await?;
+        ensure!(!raw_sell_paths.is_empty(), "no sell paths found for {}", coin_type);
+
+        let (buy_paths, sell_paths, graph_stats) =
+            optimize_paths_with_graph(raw_buy_paths, raw_sell_paths, coin_type, pool_id, &search_config);
+        info!(
+            coin_type,
+            graph_search_enabled = search_config.graph_search_enabled,
+            buy_before = graph_stats.buy_before,
+            buy_after = graph_stats.buy_after,
+            sell_before = graph_stats.sell_before,
+            sell_after = graph_stats.sell_after,
+            shortest_buy_weight = ?graph_stats.shortest_buy_weight,
+            shortest_sell_weight = ?graph_stats.shortest_sell_weight,
+            graph_buy_found = graph_stats.graph_buy_found,
+            graph_sell_found = graph_stats.graph_sell_found,
+            "候选路径准备完成"
+        );
 
         if pool_id.is_some() {
             let buy_paths_contain_pool = buy_paths.iter().any(|p| p.contains_pool(pool_id));
@@ -284,6 +328,7 @@ impl TrialCtx {
             sell_paths,
             gas_coins,
             sim_ctx,
+            search_config,
         })
     }
 
@@ -332,6 +377,25 @@ impl TrialCtx {
                 }
             })
             .collect_vec();
+        if trade_paths.is_empty() {
+            info!(
+                coin_type = %self.coin_type,
+                amount_in,
+                buy_path = %format_path(&best_buy_path),
+                pool_id = ?self.pool_id,
+                "闭环套利路径组合完成，但无可用候选"
+            );
+        } else {
+            info!(
+                coin_type = %self.coin_type,
+                amount_in,
+                pool_id = ?self.pool_id,
+                buy_path = %format_path(&best_buy_path),
+                closed_loop_count = trade_paths.len(),
+                sample_closed_loop = %format_path(&trade_paths[0]),
+                "闭环套利路径组合完成"
+            );
+        }
         ensure!(
             !trade_paths.is_empty(),
             "no trade paths found for coin {}, pool_id: {:?}",
@@ -353,7 +417,14 @@ impl TrialCtx {
             .await?;
 
         let sell_elapsed = timer.elapsed();
-        debug!(coin_type = ?self.coin_type, result = %best_trade_res, ?buy_elapsed, ?sell_elapsed, "trial result");
+        debug!(
+            coin_type = ?self.coin_type,
+            result = %best_trade_res,
+            ?buy_elapsed,
+            ?sell_elapsed,
+            graph_search_enabled = self.search_config.graph_search_enabled,
+            "trial result"
+        );
 
         let profit = best_trade_res.profit();
         if profit <= 0 {
@@ -372,13 +443,259 @@ impl TrialCtx {
     }
 }
 
+fn format_path(path: &Path) -> String {
+    path.path
+        .iter()
+        .map(|dex| {
+            let coin_in = dex.coin_in_type();
+            let coin_out = dex.coin_out_type();
+            let coin_in = coin_in.split("::").last().unwrap_or(coin_in.as_str());
+            let coin_out = coin_out.split("::").last().unwrap_or(coin_out.as_str());
+            format!("{:?}:{}->{}@{}", dex.protocol(), coin_in, coin_out, dex.object_id())
+        })
+        .join(" | ")
+}
+
+#[derive(Debug, Default)]
+struct GraphPathStats {
+    buy_before: usize,
+    sell_before: usize,
+    buy_after: usize,
+    sell_after: usize,
+    shortest_buy_weight: Option<i64>,
+    shortest_sell_weight: Option<i64>,
+    graph_buy_found: bool,
+    graph_sell_found: bool,
+}
+
+fn optimize_paths_with_graph(
+    buy_paths: Vec<Path>,
+    sell_paths: Vec<Path>,
+    coin_type: &str,
+    pool_id: Option<ObjectID>,
+    search_config: &SearchConfig,
+) -> (Vec<Path>, Vec<Path>, GraphPathStats) {
+    let raw_buy_paths = buy_paths;
+    let raw_sell_paths = sell_paths;
+
+    let mut stats = GraphPathStats {
+        buy_before: raw_buy_paths.len(),
+        sell_before: raw_sell_paths.len(),
+        buy_after: raw_buy_paths.len(),
+        sell_after: raw_sell_paths.len(),
+        ..GraphPathStats::default()
+    };
+
+    if !search_config.graph_search_enabled {
+        return (raw_buy_paths, raw_sell_paths, stats);
+    }
+
+    let mut best_edge_by_coin_pair: HashMap<(String, String), Box<dyn Dex>> = HashMap::new();
+    for path in raw_buy_paths.iter().chain(raw_sell_paths.iter()) {
+        for dex in &path.path {
+            let key = (dex.coin_in_type(), dex.coin_out_type());
+            let should_replace = best_edge_by_coin_pair
+                .get(&key)
+                .map(|existing| dex.liquidity() > existing.liquidity())
+                .unwrap_or(true);
+            if should_replace {
+                best_edge_by_coin_pair.insert(key, dex.clone());
+            }
+        }
+    }
+
+    if best_edge_by_coin_pair.is_empty() {
+        return (raw_buy_paths, raw_sell_paths, stats);
+    }
+
+    let mut graph = WeightedDigraph::default();
+    for ((coin_in, coin_out), dex) in &best_edge_by_coin_pair {
+        graph.add_edge(coin_in.clone(), coin_out.clone(), edge_weight(dex.as_ref()));
+    }
+
+    let graph_buy_path = graph.bellman_ford(SUI_COIN_TYPE).and_then(|sp| {
+        stats.shortest_buy_weight = sp.distance_to(coin_type);
+        sp.path_to(coin_type)
+            .and_then(|nodes| nodes_to_path(&nodes, &best_edge_by_coin_pair))
+    });
+    let graph_sell_path = graph.bellman_ford(coin_type).and_then(|sp| {
+        stats.shortest_sell_weight = sp.distance_to(SUI_COIN_TYPE);
+        sp.path_to(SUI_COIN_TYPE)
+            .and_then(|nodes| nodes_to_path(&nodes, &best_edge_by_coin_pair))
+    });
+
+    stats.graph_buy_found = graph_buy_path.is_some();
+    stats.graph_sell_found = graph_sell_path.is_some();
+
+    let truncate = pool_id.is_none();
+    let mut buy_paths = prioritize_paths(
+        raw_buy_paths.clone(),
+        graph_buy_path,
+        stats.shortest_buy_weight,
+        search_config.graph_hop_tolerance,
+        search_config.graph_max_paths_per_side,
+        truncate,
+    );
+    let mut sell_paths = prioritize_paths(
+        raw_sell_paths.clone(),
+        graph_sell_path,
+        stats.shortest_sell_weight,
+        search_config.graph_hop_tolerance,
+        search_config.graph_max_paths_per_side,
+        truncate,
+    );
+
+    if buy_paths.is_empty() {
+        buy_paths = paths_fallback_by_weight(&raw_buy_paths);
+    }
+    if sell_paths.is_empty() {
+        sell_paths = paths_fallback_by_weight(&raw_sell_paths);
+    }
+
+    if pool_id.is_some()
+        && !buy_paths.iter().any(|p| p.contains_pool(pool_id))
+        && !sell_paths.iter().any(|p| p.contains_pool(pool_id))
+    {
+        if let Some(path) = raw_buy_paths
+            .iter()
+            .find(|p| p.contains_pool(pool_id))
+            .cloned()
+            .or_else(|| raw_sell_paths.iter().find(|p| p.contains_pool(pool_id)).cloned())
+        {
+            let mut seen: HashSet<Vec<ObjectID>> = buy_paths
+                .iter()
+                .map(path_signature)
+                .chain(sell_paths.iter().map(path_signature))
+                .collect();
+            let sig = path_signature(&path);
+            if seen.insert(sig) {
+                if path.coin_out_type() == SUI_COIN_TYPE {
+                    sell_paths.push(path);
+                } else {
+                    buy_paths.push(path);
+                }
+            }
+        }
+    }
+
+    stats.buy_after = buy_paths.len();
+    stats.sell_after = sell_paths.len();
+    (buy_paths, sell_paths, stats)
+}
+
+fn prioritize_paths(
+    original_paths: Vec<Path>,
+    graph_path: Option<Path>,
+    shortest_weight: Option<i64>,
+    hop_tolerance: usize,
+    max_paths_per_side: usize,
+    truncate: bool,
+) -> Vec<Path> {
+    if original_paths.is_empty() {
+        return vec![];
+    }
+
+    let mut ranked = original_paths.clone();
+    ranked.sort_by_key(path_weight);
+    ranked.retain(|p| !p.is_empty());
+
+    if let Some(shortest_weight) = shortest_weight {
+        let max_allowed = shortest_weight.saturating_add(hop_tolerance as i64);
+        ranked.retain(|p| path_weight(p) <= max_allowed);
+        if ranked.is_empty() {
+            ranked = paths_fallback_by_weight(&original_paths);
+        }
+    }
+
+    let mut deduped = vec![];
+    let mut seen = HashSet::new();
+    if let Some(path) = graph_path {
+        insert_unique_path(&mut deduped, &mut seen, path);
+    }
+    for path in ranked {
+        insert_unique_path(&mut deduped, &mut seen, path);
+    }
+
+    if truncate {
+        deduped.truncate(max_paths_per_side.max(1));
+    }
+
+    deduped
+}
+
+fn paths_fallback_by_weight(paths: &[Path]) -> Vec<Path> {
+    let mut ranked = paths.to_vec();
+    ranked.sort_by_key(path_weight);
+    ranked.retain(|p| !p.is_empty());
+    if ranked.is_empty() {
+        return paths.to_vec();
+    }
+    ranked
+}
+
+fn insert_unique_path(deduped: &mut Vec<Path>, seen: &mut HashSet<Vec<ObjectID>>, path: Path) {
+    let sig = path_signature(&path);
+    if seen.insert(sig) {
+        deduped.push(path);
+    }
+}
+
+fn nodes_to_path(nodes: &[String], edge_map: &HashMap<(String, String), Box<dyn Dex>>) -> Option<Path> {
+    if nodes.len() < 2 {
+        return None;
+    }
+
+    let mut path = Vec::with_capacity(nodes.len().saturating_sub(1));
+    for pair in nodes.windows(2) {
+        let key = (pair[0].clone(), pair[1].clone());
+        let dex = edge_map.get(&key)?.clone();
+        path.push(dex);
+    }
+    Some(Path::new(path))
+}
+
+fn path_signature(path: &Path) -> Vec<ObjectID> {
+    path.path.iter().map(|dex| dex.object_id()).collect()
+}
+
+fn path_weight(path: &Path) -> i64 {
+    path.path.iter().map(|dex| edge_weight(dex.as_ref())).sum::<i64>()
+}
+
+fn edge_weight(dex: &dyn Dex) -> i64 {
+    // Prioritize fewer hops first, then fee/slippage/gas.
+    let hop_penalty = 100i64;
+    let fee_penalty_bps = protocol_fee_bps(dex.protocol()) as i64;
+    let liquidity_penalty_bps = low_liquidity_penalty_bps(dex.liquidity()) as i64;
+    let gas_penalty_bps = 3i64;
+
+    hop_penalty + fee_penalty_bps + liquidity_penalty_bps + gas_penalty_bps
+}
+
+fn protocol_fee_bps(protocol: Protocol) -> u64 {
+    match protocol {
+        Protocol::DeepbookV2 | Protocol::DeepbookV3 => 8,
+        Protocol::Aftermath => 10,
+        Protocol::Cetus | Protocol::Turbos | Protocol::KriyaClmm | Protocol::FlowxClmm => 30,
+        Protocol::KriyaAmm | Protocol::FlowxAmm | Protocol::SuiSwap | Protocol::BlueMove => 30,
+        Protocol::Navi => 5,
+        _ => 30,
+    }
+}
+
+fn low_liquidity_penalty_bps(liquidity: u128) -> u64 {
+    // Lightweight slippage proxy: lower liquidity => larger penalty.
+    let liq = liquidity.max(1);
+    ((1_000_000_000_000u128 / liq).min(120)) as u64
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct TrialResult {
-    pub coin_type: String,  //表示套利交易中使用的代币类型
-    pub amount_in: u64, //参与套利交易的输入金额
-    pub profit: u64, //表示套利交易的利润
-    pub trade_path: Path, //表示套利交易的路径
-    pub cache_misses: u64, //表示缓存未命中的次数
+    pub coin_type: String,
+    pub amount_in: u64,
+    pub profit: u64,
+    pub trade_path: Path,
+    pub cache_misses: u64,
 }
 
 impl PartialOrd for TrialResult {
@@ -453,7 +770,9 @@ mod tests {
         let sim_ctx = SimulateCtx::new(epoch, vec![]);
 
         let gas_coins = coin::get_gas_coin_refs(&sui, sender, None).await.unwrap();
-        let arb = Arb::new(TEST_HTTP_URL, Arc::new(simulator_pool)).await.unwrap();
+        let arb = Arb::new(TEST_HTTP_URL, Arc::new(simulator_pool), SearchConfig::default())
+            .await
+            .unwrap();
         let coin_type = "0xce7ff77a83ea0cb6fd39bd8748e2ec89a3f41e8efdc3f4eb123e0ca37b184db2::buck::BUCK";
 
         let arb_res = arb

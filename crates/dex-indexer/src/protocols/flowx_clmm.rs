@@ -16,8 +16,7 @@ use sui_sdk::{
 };
 use sui_types::{dynamic_field::derive_dynamic_field_id, TypeTag};
 use utils::object::{
-    extract_object_id_from_move_struct, extract_struct_from_move_struct,
-    extract_u64_from_move_struct,
+    extract_object_id_from_move_struct, extract_struct_from_move_struct, extract_u64_from_move_struct,
 };
 
 use super::{get_coin_decimals, get_pool_coins_type, SUI_RPC_NODE};
@@ -234,17 +233,13 @@ pub async fn flowx_clmm_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simula
         let move_obj = pool_obj.data.try_as_move().ok_or_eyre("Not a Move object")?;
         MoveStruct::simple_deserialize(move_obj.contents(), &layout).map_err(|e| eyre!(e))?
     };
-    let sui_client = SuiClientBuilder::default()
-    .build(SUI_RPC_NODE)
-    .await
-    .unwrap();
+    let sui_client = SuiClientBuilder::default().build(SUI_RPC_NODE).await.unwrap();
 
-    // get next init_tick using obejctID 
+    // get next init_tick using obejctID
     {
-        let parent_id =
-        ObjectID::from_str("0xe746a19bf5e4ef0e5aa7993d9a36e49bd8f0928390723d43f2ebbbf87c416ef2")?;
+        let parent_id = ObjectID::from_str("0xe746a19bf5e4ef0e5aa7993d9a36e49bd8f0928390723d43f2ebbbf87c416ef2")?;
         let key_tag =
-        TypeTag::from_str("0x25929e7f29e0a30eb4e692952ba1b5b65a3a4d65ab5f2a32e1ba3edcb587f26d::i32::I32").unwrap();
+            TypeTag::from_str("0x25929e7f29e0a30eb4e692952ba1b5b65a3a4d65ab5f2a32e1ba3edcb587f26d::i32::I32").unwrap();
         let bit_map_len = 256u32;
         for i in 0..bit_map_len {
             let key_bytes = bcs::to_bytes(&i)?;
@@ -267,7 +262,7 @@ pub async fn flowx_clmm_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simula
         let key_tag = TypeTag::from_str("0x02::dynamic_object_field::Wrapper<0x25929e7f29e0a30eb4e692952ba1b5b65a3a4d65ab5f2a32e1ba3edcb587f26d::pool_manager::PoolDfKey>").unwrap();
         let child_id = derive_dynamic_field_id(pool_registry_id, &key_tag, &key_bytes)?;
         res.push(child_id.to_string());
-    } 
+    }
 
     // tick bitmap IDs
     {
@@ -281,21 +276,24 @@ pub async fn flowx_clmm_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simula
 
         let mut next_cursor = None;
         let mut tick_vec = Vec::new();
-    
+
         loop {
-            let ret = sui_client.read_api().get_dynamic_fields(tick_bitmap_id, next_cursor, None).await?;
+            let ret = sui_client
+                .read_api()
+                .get_dynamic_fields(tick_bitmap_id, next_cursor, None)
+                .await?;
             next_cursor = ret.next_cursor;
-            tick_vec.extend(ret.data); 
+            tick_vec.extend(ret.data);
             if !ret.has_next_page {
                 break;
             }
         }
-        let tick_vec: Vec<String> = tick_vec.iter().map(|field_info| {
-            field_info.object_id.to_string()
-        }).collect();
+        let tick_vec: Vec<String> = tick_vec
+            .iter()
+            .map(|field_info| field_info.object_id.to_string())
+            .collect();
         res.extend(tick_vec);
     }
-
 
     // ticks
     {
@@ -308,16 +306,20 @@ pub async fn flowx_clmm_pool_children_ids(pool: &Pool, simulator: Arc<dyn Simula
         let mut next_cursor = None;
         let mut tick_vec = Vec::new();
         loop {
-            let ret = sui_client.read_api().get_dynamic_fields(ticks_id, next_cursor, None).await?;
+            let ret = sui_client
+                .read_api()
+                .get_dynamic_fields(ticks_id, next_cursor, None)
+                .await?;
             next_cursor = ret.next_cursor;
-            tick_vec.extend(ret.data); 
+            tick_vec.extend(ret.data);
             if !ret.has_next_page {
                 break;
             }
         }
-        let tick_vec: Vec<String> = tick_vec.iter().map(|field_info| {
-            field_info.object_id.to_string()
-        }).collect();
+        let tick_vec: Vec<String> = tick_vec
+            .iter()
+            .map(|field_info| field_info.object_id.to_string())
+            .collect();
         res.extend(tick_vec);
     }
 
@@ -409,5 +411,4 @@ mod tests {
         println!("{:?} ===================> {:?} ", children_ids, children_ids.len());
         println!("Took ==============> : {} ms", start.elapsed().as_millis());
     }
-
 }
